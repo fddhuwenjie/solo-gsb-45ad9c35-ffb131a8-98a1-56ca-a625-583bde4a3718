@@ -12,11 +12,13 @@ can continue against a fresh SQLite file under its original ``session_id``:
   (arbitrary-precision values included).
 
 Import is deliberately strict. The checkpoint envelope is checked for
-internal self-consistency (tail vs. offset, the stored response vs. the
-stored offsets/tail, audit block vs. its enabled flag); the route layer then
-verifies the target database has the exact protocol version registered with
-the very same definition digest. Anything else makes the whole import fail
-without touching existing target state.
+internal self-consistency (tail start vs. received offset and decoded tail
+length, the stored response vs. the stored offsets/tail, audit block vs. its
+enabled flag and modulus range); the route layer then verifies the target
+database has the exact protocol version registered with the very same
+definition digest *and* a sequence field whose effective unsigned bit width
+equals the checkpoint's audit modulus. Anything else makes the whole import
+fail without touching existing target state.
 """
 from __future__ import annotations
 
@@ -158,6 +160,18 @@ def _check_audit(cp: SessionCheckpoint, problems: list[str]) -> None:
         if cp.sequence_audit is None:
             problems.append("audit_enabled is true but sequence_audit block is missing")
             return
+        # The carried baseline must be a raw value representable in the
+        # declared modulus; whether that modulus matches the target
+        # protocol is checked against the target database at import time.
+        audit = cp.sequence_audit
+        if audit.last_sequence is not None and not (
+            0 <= audit.last_sequence < (1 << audit.bit_width)
+        ):
+            problems.append(
+                f"sequence_audit.last_sequence {audit.last_sequence} is outside "
+                f"the raw range [0, {1 << audit.bit_width}) of bit_width "
+                f"{audit.bit_width}"
+            )
     elif cp.sequence_audit is not None:
         problems.append("audit_enabled is false but a sequence_audit block is present")
 
@@ -190,8 +204,22 @@ def _check_response(cp: SessionCheckpoint, problems: list[str]) -> None:
         problems.append("last_response.tail.payload_b64 does not match the checkpoint tail")
     if resp.tail.end != cp.received_offset:
         problems.append("last_response.tail.end does not equal received_offset")
-    if resp.tail.start > resp.tail.end:
-        problems.append("last_response.tail.start is after tail.end")
+    # The original response's tail starts exactly at the received offset
+    # minus the decoded tail byte count: that position is what the next
+    # append prepends its chunk with. A merely in-range (start <= end) but
+    # shifted start would resume decoding from the wrong session position.
+    # Invalid base64 was already reported while decoding the checkpoint tail.
+    try:
+        tail_len = len(base64.b64decode(cp.tail_b64, validate=True))
+    except (binascii.Error, ValueError):
+        tail_len = None
+    if tail_len is not None:
+        expected_tail_start = cp.received_offset - tail_len
+        if resp.tail.start != expected_tail_start:
+            problems.append(
+                "last_response.tail.start does not equal received_offset minus "
+                f"the decoded tail byte count ({expected_tail_start})"
+            )
     if resp.received_offset != cp.last_chunk_offset:
         problems.append(
             "last_response.received_offset does not equal last_chunk_offset"
@@ -236,7 +264,27 @@ def _check_response(cp: SessionCheckpoint, problems: list[str]) -> None:
         problems.append("sequence_audit.indeterminates disagrees with the stored response")
     if report.missing_total != audit.missing_total:
         problems.append("sequence_audit.missing_total disagrees with the stored response")
+    # Every raw sequence carried by the stored response (confirmed frames and
+    # anomaly details) must fit the declared modulus; the decoder masks
+    # bit-fields and reads fixed-width integers, so any out-of-range value can
+    # only come from a tampered checkpoint.
+    seq_limit = 1 << audit.bit_width
+    for frame in resp.frames:
+        if frame.sequence is not None and not (0 <= frame.sequence < seq_limit):
+            problems.append(
+                f"last_response frame sequence {frame.sequence} is outside the "
+                f"raw range [0, {seq_limit}) of bit_width {audit.bit_width}"
+            )
+            break
     for anomaly in report.anomalies:
+        if not (0 <= anomaly.previous_sequence < seq_limit) or not (
+            0 <= anomaly.sequence < seq_limit
+        ):
+            problems.append(
+                "a sequence anomaly carries a raw sequence outside the "
+                f"range [0, {seq_limit}) of bit_width {audit.bit_width}"
+            )
+            break
         if not (0 <= anomaly.frame_start < anomaly.frame_end <= cp.received_offset):
             problems.append("a sequence anomaly interval falls outside the accepted range")
             break

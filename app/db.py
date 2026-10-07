@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .audit import MIN_BIT_WIDTH, sequence_bit_width
 from .models import DecodeResponse, ProtocolDefinition
 
 # Every column of the sessions table, in declaration order. Used by the
@@ -443,61 +444,108 @@ class Database:
         * ``"session_exists"`` — a session with this id already exists, the
           target state is left untouched (no overwrite);
         * ``"protocol_mismatch"`` — the exact protocol version is not
-          registered with the given definition digest, nothing was written.
+          registered with the given definition digest, nothing was written;
+        * ``"audit_mismatch"`` — the checkpoint carries sequence-audit
+          progress that the target database's exact protocol cannot support
+          (no valid unsigned sequence field, or an effective bit width
+          different from the checkpoint's modulus), nothing was written.
 
-        The checks run inside the same write transaction as the INSERT,
-        closing the time-of-check/time-of-use window against a concurrent
-        registration or a competing import on another process.
+        Every check — definition digest, the protocol's sequence field and
+        effective bit width, and the absence of a same-id session — runs
+        inside the same ``BEGIN IMMEDIATE`` write transaction as the INSERT.
+        A concurrent protocol registration (or competing import on another
+        process) is serialised by the write lock and cannot make the checks
+        pass against one committed protocol version while another version
+        lands in the row: once this transaction holds the lock, the protocol
+        row it verified cannot change underneath it before the INSERT.
         """
         conn = self.conn
-        with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
             prow = conn.execute(
-                "SELECT definition_sha256 FROM protocols "
+                "SELECT definition, definition_sha256 FROM protocols "
                 "WHERE protocol_id = ? AND version = ?",
                 (protocol_id, version),
             ).fetchone()
             if prow is None or prow["definition_sha256"] != definition_sha:
-                return "protocol_mismatch"
-            existing = conn.execute(
+                outcome = "protocol_mismatch"
+            elif audit_enabled and not self._protocol_supports_audit(
+                prow, audit_bit_width
+            ):
+                outcome = "audit_mismatch"
+            elif conn.execute(
                 "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
-            ).fetchone()
-            if existing is not None:
-                return "session_exists"
+            ).fetchone() is not None:
+                outcome = "session_exists"
+            else:
+                try:
+                    conn.execute(
+                        "INSERT INTO sessions "
+                        "(session_id, protocol_id, version, received_offset, tail_b64, "
+                        " frames_total, last_chunk_offset, last_chunk_sha256, last_response, "
+                        " audit_enabled, audit_bit_width, audit_last_sequence, "
+                        " audit_duplicates, audit_suspected_gaps, audit_backwards, "
+                        " audit_indeterminates, audit_missing_total) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            session_id,
+                            protocol_id,
+                            version,
+                            received_offset,
+                            tail_b64,
+                            frames_total,
+                            last_chunk_offset,
+                            last_chunk_sha,
+                            last_response_json,
+                            int(audit_enabled),
+                            audit_bit_width,
+                            _encode_wide(audit_last_sequence),
+                            audit_duplicates,
+                            audit_suspected_gaps,
+                            audit_backwards,
+                            audit_indeterminates,
+                            _encode_wide(audit_missing_total),
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    # Another process sharing this database file inserted the
+                    # same session_id between the existence check and the
+                    # INSERT; the transaction rolls back, nothing is written.
+                    outcome = "session_exists"
+                else:
+                    outcome = "imported"
+            if outcome == "imported":
+                conn.execute("COMMIT")
+            else:
+                conn.execute("ROLLBACK")
+        except BaseException:
+            # Commit (or any statement) raised: roll the still-open write
+            # transaction back so nothing is left half applied.
             try:
-                conn.execute(
-                    "INSERT INTO sessions "
-                    "(session_id, protocol_id, version, received_offset, tail_b64, "
-                    " frames_total, last_chunk_offset, last_chunk_sha256, last_response, "
-                    " audit_enabled, audit_bit_width, audit_last_sequence, "
-                    " audit_duplicates, audit_suspected_gaps, audit_backwards, "
-                    " audit_indeterminates, audit_missing_total) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        session_id,
-                        protocol_id,
-                        version,
-                        received_offset,
-                        tail_b64,
-                        frames_total,
-                        last_chunk_offset,
-                        last_chunk_sha,
-                        last_response_json,
-                        int(audit_enabled),
-                        audit_bit_width,
-                        _encode_wide(audit_last_sequence),
-                        audit_duplicates,
-                        audit_suspected_gaps,
-                        audit_backwards,
-                        audit_indeterminates,
-                        _encode_wide(audit_missing_total),
-                    ),
-                )
-            except sqlite3.IntegrityError:
-                # Another process sharing this database file inserted the
-                # same session_id between the existence check and the INSERT;
-                # the enclosing transaction rolls back and nothing is written.
-                return "session_exists"
-        return "imported"
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        return outcome
+
+    @staticmethod
+    def _protocol_supports_audit(prow: sqlite3.Row, audit_bit_width: int | None) -> bool:
+        """Whether the exact verified protocol row carries the checkpoint's modulus.
+
+        The pinned protocol must declare an unsigned integer sequence field of
+        at least MIN_BIT_WIDTH effective bits whose width equals the
+        checkpoint's audit bit width. Parsed from the protocol row read inside
+        the import write transaction, so a tampered checkpoint (e.g. an 8-bit
+        field carried as 2 bits) can never enter the target database and later
+        appends can never audit against the wrong modulus.
+        """
+        proto = Database.row_to_protocol(prow)
+        target_width = sequence_bit_width(proto)
+        return (
+            target_width is not None
+            and target_width >= MIN_BIT_WIDTH
+            and target_width == audit_bit_width
+        )
 
     def save_session_append(
         self,

@@ -649,10 +649,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """Import a checkpointed session so it continues under its original id.
 
         Only accepted when the target database has the exact protocol version
-        registered with an identical definition digest, no session with the
-        checkpoint id exists yet, and the checkpoint is internally consistent
-        (tail/offset and the stored original response self-consistent). On
-        success every state element lands in one row/transaction; on any
+        registered with an identical definition digest *and* a sequence field
+        whose effective unsigned bit width matches the checkpoint's audit
+        modulus, no session with the checkpoint id exists yet, and the
+        checkpoint is internally consistent (tail start vs. received offset and
+        decoded tail length, the stored original response self-consistent, and
+        every carried raw sequence within the modulus range). Protocol
+        verification and the session write run in one write transaction, so a
+        concurrent registration cannot slip a different protocol in between.
+        On success every state element lands in one row/transaction; on any
         failure the target database is left completely untouched.
         """
         try:
@@ -708,6 +713,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "protocol_id": checkpoint.protocol_id,
                         "version": checkpoint.version,
                         "definition_sha256": checkpoint.definition_sha256,
+                    },
+                )
+            if result == "audit_mismatch":
+                # The exact target protocol is registered, but it does not
+                # carry the checkpoint's declared sequence modulus: either it
+                # no longer declares a usable unsigned sequence field or its
+                # effective bit width differs. Importing would resume the
+                # audit against the wrong modulus, so the whole import fails.
+                target = db.find_protocol(
+                    checkpoint.protocol_id, checkpoint.version
+                )
+                target_width = (
+                    sequence_bit_width(target[0]) if target is not None else None
+                )
+                raise SessionCheckpointInvalidError(
+                    message=(
+                        "the checkpoint's sequence_audit bit width does not "
+                        "match the effective unsigned sequence-field bit width "
+                        f"of protocol '{checkpoint.protocol_id}' version "
+                        f"{checkpoint.version} registered in the target database"
+                    ),
+                    details={
+                        "reason": "audit_mismatch",
+                        "protocol_id": checkpoint.protocol_id,
+                        "version": checkpoint.version,
+                        "checkpoint_bit_width": (
+                            checkpoint.sequence_audit.bit_width
+                            if checkpoint.sequence_audit is not None
+                            else None
+                        ),
+                        "target_bit_width": target_width,
                     },
                 )
             if result == "session_exists":

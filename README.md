@@ -36,9 +36,11 @@
 - **换库检查点导出 / 导入** `GET /sessions/{id}/checkpoint` + `POST /sessions/import`：更换
   SQLite 数据库时，把会话在**同一已提交时刻**的确切协议版本与定义摘要、接收偏移、原始待决尾部、
   累计帧数、最近分片摘要与原响应、序号稽核进度导出为可移植 JSON；目标库只在已注册**摘要相同的
-  确切协议版本**、无同名会话且检查点自洽时在**一个事务内**按原 `session_id` 落库，否则整次失败、
-  不覆盖现有状态。导入后跨分片解码与稽核无缝接续，最近分片重发仍返回原响应而不重复计数，超出
-  SQLite 有符号整数范围的稽核值保持精确（示例见 4.8）。
+  确切协议版本**、该协议序号字段的**有效位宽与检查点稽核模数一致**（序号基准落在位宽原始范围内）、
+  原响应尾部起点恰为**接收偏移减解码后尾部字节数**、无同名会话且检查点自洽时，在**一个
+  `BEGIN IMMEDIATE` 事务内**按原 `session_id` 落库，否则整次失败、不覆盖现有状态；并发协议注册或
+  竞争导入无法在核验与写入之间绕过检查。导入后跨分片解码与稽核无缝接续，最近分片重发仍返回原响应
+  而不重复计数，超出 SQLite 有符号整数范围的稽核值保持精确（示例见 4.8）。
 - **丢弃区间审计**：每次跳过都返回 `[start, end)` 区间与各候选的失败原因
   （`length_out_of_bounds` / `crc_failed` / `malformed_escape`）。
 - **结果复用**：同一协议版本 + 输入字节 SHA-256 摘要命中 SQLite 缓存，响应中
@@ -817,22 +819,59 @@ curl -s -X POST localhost:8001/sessions/import \
 导入只在以下条件**全部**满足时才接受，并且所有状态在**一个数据库事务内一次落库**：
 
 1. 目标库已注册 `protocol_id` + 确切 `version`，且其 `definition_sha256` 与检查点**完全相同**；
-2. 目标库中**不存在**同一 `session_id` 的会话；
-3. 检查点自洽：尾部可解码且不长于接收偏移；最近响应的会话/协议标识、`next_offset`、尾部、
-   `frames_total` 与检查点其余字段一致；最近分片偏移/摘要齐备（未追加过的空会话除外）；
-   稽核块与 `audit_enabled` 一致且与最近响应中的稽核累计一致。
+2. 检查点启用序号稽核时，目标库该确切协议必须仍声明**有效无符号整数序号字段**（`u*` 类型且未置
+   `signed`，位域按 `bit_width` 计、宽度 ≥2），且其**有效位宽与检查点的
+   `sequence_audit.bit_width` 完全一致**（稽核模数必须等于目标协议序号字段位宽）；`last_sequence`
+   等响应内携带的原始序号还必须落在该位宽的原始范围 `[0, 2^bit_width)` 内；
+3. 目标库中**不存在**同一 `session_id` 的会话；
+4. 检查点自洽：尾部可解码且不长于接收偏移；**最近响应的 `tail.start` 必须恰好等于接收偏移减去
+   解码后尾部字节数**（续采起点，落在区间内但整体平移也拒绝）；最近响应的会话/协议标识、
+   `next_offset`、尾部、`frames_total` 与检查点其余字段一致；最近分片偏移/摘要齐备（未追加过的空
+   会话除外）；稽核块与 `audit_enabled` 一致且与最近响应中的稽核累计一致。
+
+协议核验（定义摘要 + 序号字段/位宽）、同名会话检查与会话行写入在**同一个 `BEGIN IMMEDIATE` 写事务**
+内完成：并发的协议注册（或另一进程上的竞争导入）只能在该事务结束后提交，无法在核验与写入之间替换
+协议定义或凭空注册协议来绕过核验。
 
 任何一条不满足，**整次导入失败、目标库不写任何内容、也不覆盖现有状态**：
 
 | HTTP | code | details.reason / 说明 |
 | --- | --- | --- |
 | 422 | `SESSION_IMPORT_INVALID` | `protocol_mismatch`：目标库未注册该确切版本，或已注册但定义摘要不同 |
-| 422 | `SESSION_IMPORT_INVALID` | `details.problems`：检查点格式版本不支持、字段缺失/越界、尾部/偏移/最近响应/稽核不自洽 |
+| 422 | `SESSION_IMPORT_INVALID` | `audit_mismatch`：检查点稽核位宽与目标协议序号字段的有效位宽不符，或目标协议无可用的无符号序号字段（附 `checkpoint_bit_width` / `target_bit_width`） |
+| 422 | `SESSION_IMPORT_INVALID` | `details.problems`：检查点格式版本不支持、字段缺失/越界、`tail.start` 与接收偏移/尾部字节数不符、序号超出位宽基准范围、最近响应/稽核不自洽 |
 | 409 | `SESSION_IMPORT_CONFLICT` | `session_exists`：目标库已有同名会话，现有状态原样保留 |
 | 422 | `INVALID_JSON` | 请求体不是合法 JSON |
 
 因此可以安全重试：修正协议注册或检查点后重新 POST 即可；目标库已有该会话时重复导入只会得到
 409，既有进度不会被覆盖。
+
+畸形检查点（稽核模数被篡改、尾部起点平移）会原样返回 422 `SESSION_IMPORT_INVALID`，整次不落库：
+
+```bash
+# 例 1：目标协议的 seq 是 u8（有效位宽 8），检查点却把稽核模数改成 2
+#        （顶层 sequence_audit.bit_width 与 last_response 内同步改为 2）
+jq '.sequence_audit.bit_width = 2
+    | .last_response.sequence_audit.bit_width = 2' /tmp/session-checkpoint.json \
+  | curl -s -X POST localhost:8001/sessions/import \
+      -H 'Content-Type: application/json' --data @-
+# -> 422 {"error": {"code": "SESSION_IMPORT_INVALID",
+#        "message": "…",
+#        "details": {"reason": "audit_mismatch",
+#                    "checkpoint_bit_width": 2, "target_bit_width": 8, …}}}
+
+# 例 2：last_response.tail.start 被改小（仍不超过 tail.end，但不等于
+#        received_offset - 解码后尾部字节数）
+jq '.last_response.tail.start -= 1' /tmp/session-checkpoint.json \
+  | curl -s -X POST localhost:8001/sessions/import \
+      -H 'Content-Type: application/json' --data @-
+# -> 422 {"error": {"code": "SESSION_IMPORT_INVALID",
+#        "details": {"problems": ["…tail.start does not equal received_offset
+#                                 minus the decoded tail byte count …"]}}}
+```
+
+两种情况下目标库都不会写入该会话（随后用未篡改的检查点重新导入即可成功）；若目标库已有同名会话，
+则无论检查点内容如何都返回 409 `SESSION_IMPORT_CONFLICT`，现有状态不变。
 
 ##### 4.8.3 导入后重放最近分片并跨片续采
 
@@ -908,7 +947,7 @@ curl -s -X POST localhost:8001/sessions/append -H 'Content-Type: application/jso
 | 404 | `SESSION_NOT_FOUND` | 会话 ID 不存在（追加或进度查询） |
 | 409 | `SESSION_APPEND_CONFLICT` | 会话追加：同偏移不同内容（`reason=content_mismatch`）或乱序/跳跃/并发提交（`reason=offset_mismatch`），状态不变 |
 | 422 | `SEQUENCE_AUDIT_UNSUPPORTED` | 创建会话时启用了序号稽核，但协议未声明有效位宽 ≥2 的无符号整数序号字段 |
-| 422 | `SESSION_IMPORT_INVALID` | 会话检查点导入：目标库未注册摘要相同的确切协议版本（`reason=protocol_mismatch`），或检查点格式/自洽性校验失败（`details.problems`） |
+| 422 | `SESSION_IMPORT_INVALID` | 会话检查点导入：目标库未注册摘要相同的确切协议版本（`reason=protocol_mismatch`）、检查点稽核位宽与目标协议序号字段有效位宽不符（`reason=audit_mismatch`），或检查点格式/自洽性校验失败（含 `tail.start` 与接收偏移减尾部字节数不符、序号超出位宽基准范围；`details.problems`） |
 | 409 | `SESSION_IMPORT_CONFLICT` | 会话检查点导入：目标库已存在同 `session_id` 的会话（`reason=session_exists`），不覆盖现有状态 |
 | 413 | `PAYLOAD_TOO_LARGE` | 超 `RESYNC_MAX_DECODE_BYTES`（会话中指 待决尾部 + 新分片 的拼合大小） |
 
@@ -926,7 +965,7 @@ curl -s -X POST localhost:8001/sessions/append -H 'Content-Type: application/jso
 | `POST` | `/sessions/append` | 追加非空 base64 分片（尾部自动拼接，仅返回本次新结果与本次稽核异常） |
 | `GET` | `/sessions/{id}` | 查询会话进度（偏移/待决尾部/累计帧数/最近一次分片/稽核累计） |
 | `GET` | `/sessions/{id}/checkpoint` | 导出会话检查点（同一已提交时刻的协议摘要/偏移/尾部/帧数/最近分片与原响应/稽核进度），供换库导入 |
-| `POST` | `/sessions/import` | 导入会话检查点到目标库（要求确切协议版本且定义摘要相同、无同名会话、检查点自洽，一次事务落库） |
+| `POST` | `/sessions/import` | 导入会话检查点到目标库（要求确切协议版本且定义摘要相同、稽核位宽与目标协议序号字段一致、尾部起点与接收偏移/尾部字节数相符、无同名会话、检查点自洽，协议核验与会话写入在同一写事务内一次落库） |
 
 同 ID + 版本重复提交**完全相同**的定义是幂等的（返回 `replaced=true`）；定义不同则 409。
 
@@ -940,7 +979,7 @@ app/
   decoder.py   # 候选扫描、反转义、长度/CRC 校验、重同步与歧义判定
   encoder.py   # 字段写入（位域/定点反算/冲突检测）、长度与 CRC 派生、转义、回读校验
   audit.py     # 会话序号连续性稽核（取模比较、异常分类、基准推进）
-  checkpoint.py # 会话检查点信封的自洽性校验（换库导出/导入）
+  checkpoint.py # 会话检查点信封的自洽性校验（尾部起点/序号基准范围/最近响应，换库导出/导入）
   db.py        # SQLite：协议表 + (协议版本, 输入摘要) 结果缓存 + 采集会话状态表（含稽核列、检查点导入）
   errors.py    # 结构化错误类型
   main.py      # FastAPI 路由与错误处理（/decode、/encode、/sessions[/append]、检查点导出/导入）
@@ -989,7 +1028,10 @@ dangling 转义符）只产出一次且偏移为累计位置、最近分片同�
 继续写入超大序号，以及未启用稽核会话与无状态 `/decode` 对同样宽序号的行为保持不变。
 `tests/test_session_checkpoints.py` 覆盖换库检查点：导出包含同一已提交时刻的协议定义摘要、偏移、
 原始尾部、累计帧数、最近分片摘要与原响应及稽核进度（含未追加的空会话）；目标库缺协议/定义摘要
-不同/已有同名会话分别 422 `protocol_mismatch` 与 409 `session_exists` 且不写不覆盖；尾部与偏移、
-最近响应、稽核块等被篡改或格式版本不支持一律 422 且目标库不留任何行；导入后最近分片重放返回
-原响应（`replayed`）不重复计数、跨分片帧在原累计位置补齐、稽核从导入基准与累计值续判、超过
-2⁶³ 的宽稽核值在目标库仍以精确十进制文本保存，以及导入状态在目标服务重启后照常重放与续采。
+不同/稽核位宽与目标协议序号字段不一致（8 位被篡改为 2 位等，含只改顶层模数的结构性拒绝）/序号基准
+超出位宽范围/已有同名会话分别 422（`protocol_mismatch` / `audit_mismatch` / `details.problems`）
+与 409 `session_exists` 且不写不覆盖；`tail.start` 不等于接收偏移减解码尾部字节数（即使未越过
+`tail.end`）一律 422；并发协议注册在导入写事务持锁期间阻塞、不能绕过核验；导入后最近分片重放
+返回原响应（`replayed`）不重复计数、跨分片帧在原累计位置补齐、稽核按正确模数从导入基准与累计值
+续判、超过 2⁶³ 的宽稽核值在目标库仍以精确十进制文本保存，以及导入状态在目标服务重启后照常重放
+与续采。
