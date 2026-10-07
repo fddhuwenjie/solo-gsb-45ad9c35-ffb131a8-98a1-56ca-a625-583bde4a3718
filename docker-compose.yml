@@ -1,0 +1,21 @@
+services:
+  resync-api:
+    build: .
+    image: sensor-resync-api:latest
+    container_name: sensor-resync-api
+    ports:
+      - "8000:8000"
+    environment:
+      RESYNC_DB_PATH: /data/resync.db
+      RESYNC_MAX_DECODE_BYTES: "1048576"
+    volumes:
+      - resync-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  resync-data:
