@@ -468,6 +468,241 @@ def test_audit_envelope_contradictions_are_rejected(db_path, tmp_path):
     assert r.status_code == 422
 
 
+def _audited_checkpoint(db_path):
+    src = make_client(db_path)
+    register_standard(src)
+    sid = make_session(
+        src, {"protocol_id": "sensor-line", "version": 1, "sequence_audit": True}
+    )
+    chunk = b"\x12" + SYNC + build_logical(1, 3, 2345) + b"\xaa"
+    append(src, sid, 0, chunk)
+    return src, sid, chunk, export_checkpoint(src, sid)
+
+
+def test_tampered_audit_bit_width_is_rejected_against_target_protocol(
+    db_path, tmp_path
+):
+    """Both bit_width copies at 2 must not import when the target field is 8."""
+    _, sid, chunk, good = _audited_checkpoint(db_path)
+
+    dst = make_client(str(tmp_path / "target.db"))
+    register_standard(dst)
+
+    bad = copy.deepcopy(good)
+    bad["sequence_audit"]["bit_width"] = 2
+    bad["last_response"]["sequence_audit"]["bit_width"] = 2
+    r = import_checkpoint(dst, bad)
+    assert r.status_code == 422, r.text
+    err = r.json()["error"]
+    assert err["code"] == "SESSION_IMPORT_INVALID"
+    assert err["details"]["reason"] == "audit_bit_width_mismatch"
+    assert err["details"]["target_bit_width"] == 8
+    assert err["details"]["checkpoint_bit_width"] == 2
+    assert dst.get(f"/sessions/{sid}").status_code == 404
+
+    # Nothing landed; the intact checkpoint imports and subsequent appends use
+    # the protocol's true modulus (256), not the tampered 4.
+    assert import_checkpoint(dst, good).status_code == 201
+    cont = append(
+        dst,
+        sid,
+        len(chunk),
+        b"\x55" + build_logical(2, 3, 100),
+    ).json()
+    assert cont["frames"][0]["sequence"] == 2
+    assert cont["sequence_audit"]["bit_width"] == 8
+    # seq 1 -> 2 is one normal step modulo 256 (it would be a suspected gap
+    # modulo 4), proving the audit modulus came from the target protocol.
+    assert cont["sequence_audit"]["suspected_gaps"] == 0
+
+
+def test_tail_start_other_than_offset_minus_tail_bytes_is_rejected(
+    db_path, tmp_path
+):
+    _, sid, _, good = _audited_checkpoint(db_path)
+    correct_start = good["last_response"]["tail"]["start"]
+
+    dst = make_client(str(tmp_path / "target.db"))
+    register_standard(dst)
+
+    # One byte earlier: still <= end, but the tail window would re-attach an
+    # already accepted byte when the response is replayed.
+    bad = copy.deepcopy(good)
+    bad["last_response"]["tail"]["start"] = correct_start - 1
+    r = import_checkpoint(dst, bad)
+    assert r.status_code == 422
+    problems = r.json()["error"]["details"]["problems"]
+    assert any("tail.start" in p for p in problems)
+    assert dst.get(f"/sessions/{sid}").status_code == 404
+
+    # One byte later (a start past the true window, still not past end here
+    # because the tail is exactly one byte: start == end) is rejected too.
+    bad = copy.deepcopy(good)
+    bad["last_response"]["tail"]["start"] = correct_start + 1
+    r = import_checkpoint(dst, bad)
+    assert r.status_code == 422
+    assert any("tail.start" in p for p in r.json()["error"]["details"]["problems"])
+
+    assert import_checkpoint(dst, good).status_code == 201
+
+
+def test_out_of_range_baseline_sequence_is_rejected(db_path, tmp_path):
+    _, sid, _, good = _audited_checkpoint(db_path)
+    assert good["sequence_audit"]["bit_width"] == 8
+
+    dst = make_client(str(tmp_path / "target.db"))
+    register_standard(dst)
+
+    bad = copy.deepcopy(good)
+    bad["sequence_audit"]["last_sequence"] = 256
+    bad["last_response"]["sequence_audit"]["last_sequence"] = 256
+    r = import_checkpoint(dst, bad)
+    assert r.status_code == 422
+    err = r.json()["error"]
+    assert err["code"] == "SESSION_IMPORT_INVALID"
+    assert err["details"]["reason"] == "audit_sequence_out_of_range"
+    assert err["details"]["max_sequence"] == 255
+    assert dst.get(f"/sessions/{sid}").status_code == 404
+
+    # 0..255 is the accepted baseline range.
+    ok = copy.deepcopy(good)
+    ok["sequence_audit"]["last_sequence"] = 255
+    ok["last_response"]["sequence_audit"]["last_sequence"] = 255
+    assert import_checkpoint(dst, ok).status_code == 201
+
+
+def test_target_protocol_without_valid_sequence_field_rejects_audited_checkpoint(
+    db_path, tmp_path
+):
+    """No usable unsigned sequence field under the pinned digest fails import.
+
+    The checkpoint carries an audit block and names a digest the target really
+    has registered, but the registered protocol declares no valid unsigned
+    sequence field. The audit must not be silently dropped; the import fails
+    inside the verification transaction.
+    """
+    _, sid, _, good = _audited_checkpoint(db_path)
+
+    dst = make_client(str(tmp_path / "target.db"))
+    register_standard(dst, **{"sequence_field": None})
+
+    # The checkpoint claims the digest of the target's sequence-less protocol.
+    bad = copy.deepcopy(good)
+    bad["definition_sha256"] = dst.get("/protocols").json()["protocols"][0][
+        "definition_sha256"
+    ]
+    r = import_checkpoint(dst, bad)
+    assert r.status_code == 422
+    err = r.json()["error"]
+    assert err["code"] == "SESSION_IMPORT_INVALID"
+    assert err["details"]["reason"] == "audit_field_unsupported"
+    assert err["details"]["target_bit_width"] is None
+    assert dst.get(f"/sessions/{sid}").status_code == 404
+
+
+def test_import_verification_and_insert_share_one_write_transaction(
+    db_path, tmp_path
+):
+    """The import opens BEGIN IMMEDIATE before any verification read.
+
+    A competing protocol registration from another connection sharing the
+    file must wait for the import's write lock, so the digest/bit-width checks
+    and the session INSERT are one serialized critical section.
+    """
+    import sqlite3
+    import threading
+    import time
+
+    import app.db as dbmod
+
+    _, _, _, cp = _audited_checkpoint(db_path)
+    target = str(tmp_path / "target.db")
+    dst = make_client(target)
+    register_standard(dst)
+
+    # Statements executed on the import connection, in arrival order.
+    events: list[str] = []
+    db = dst.app.state.db
+    inner = db.conn
+
+    class _TracingConnection:
+        def execute(self, sql, params=()):
+            head = sql.lstrip()
+            for tag in (
+                "BEGIN",
+                "SELECT definition",
+                "SELECT 1 FROM sessions",
+                "INSERT INTO sessions",
+                "COMMIT",
+            ):
+                if head.startswith(tag):
+                    events.append(tag)
+            return inner.execute(sql, params)
+
+        def __setattr__(self, name, value):
+            # Transaction control attributes must reach the real connection.
+            if name == "isolation_level":
+                setattr(inner, name, value)
+            else:
+                object.__setattr__(self, name, value)
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+    db._local.conn = _TracingConnection()
+    result = db.import_session_checkpoint(
+        session_id=cp["session_id"],
+        protocol_id=cp["protocol_id"],
+        version=cp["version"],
+        definition_sha=cp["definition_sha256"],
+        received_offset=cp["received_offset"],
+        tail_b64=cp["tail_b64"],
+        frames_total=cp["frames_total"],
+        last_chunk_offset=cp["last_chunk_offset"],
+        last_chunk_sha=cp["last_chunk_sha256"],
+        last_response_json="",
+        audit_enabled=True,
+        audit_bit_width=cp["sequence_audit"]["bit_width"],
+        audit_last_sequence=cp["sequence_audit"]["last_sequence"],
+        audit_duplicates=0,
+        audit_suspected_gaps=0,
+        audit_backwards=0,
+        audit_indeterminates=0,
+        audit_missing_total=0,
+    )
+    db._local.conn = inner
+    assert result == "imported"
+    assert events[0] == "BEGIN"
+    assert events.index("SELECT definition") < events.index("INSERT INTO sessions")
+    assert events[-1] == "COMMIT"
+
+    # While a writer holds the database write lock, a protocol registration
+    # from a second shared connection blocks until the import-style txn ends.
+    locker = dbmod._connect(target)
+    locker.isolation_level = None
+    locker.execute("BEGIN IMMEDIATE")
+
+    second = make_client(target)
+    registered = threading.Event()
+
+    def register():
+        from app.models import ProtocolDefinition
+
+        other = standard_protocol(protocol_id="other-line")
+        second.app.state.db.upsert_protocol(
+            ProtocolDefinition.model_validate(other), "0" * 64
+        )
+        registered.set()
+
+    t = threading.Thread(target=register)
+    t.start()
+    assert not registered.wait(0.7), "registration bypassed the held write lock"
+    locker.execute("ROLLBACK")
+    locker.close()
+    assert registered.wait(5)
+    t.join(5)
+
+
 def test_cross_process_import_race_loses_cleanly(tmp_path):
     """A same-id INSERT racing a peer process hits the PRIMARY KEY.
 

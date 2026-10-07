@@ -12,10 +12,14 @@ can continue against a fresh SQLite file under its original ``session_id``:
   (arbitrary-precision values included).
 
 Import is deliberately strict. The checkpoint envelope is checked for
-internal self-consistency (tail vs. offset, the stored response vs. the
-stored offsets/tail, audit block vs. its enabled flag); the route layer then
-verifies the target database has the exact protocol version registered with
-the very same definition digest. Anything else makes the whole import fail
+internal self-consistency (tail vs. offset — including the stored response's
+tail start being exactly ``received_offset`` minus the decoded tail bytes —
+the stored response vs. the stored offsets/tail, audit block vs. its enabled
+flag); the route layer then verifies the target database inside one write
+transaction: it must have the exact protocol version registered with the very
+same definition digest, and for audited sessions the registered protocol must
+declare the matching valid sequence field/bit width with the imported
+baseline inside its sequence range. Anything else makes the whole import fail
 without touching existing target state.
 """
 from __future__ import annotations
@@ -142,7 +146,7 @@ def _check_cross_fields(cp: SessionCheckpoint, problems: list[str]) -> None:
     _check_audit(cp, problems)
 
     if cp.last_response is not None:
-        _check_response(cp, problems)
+        _check_response(cp, problems, tail_len)
 
 
 def _decode_tail(cp: SessionCheckpoint, problems: list[str]) -> int | None:
@@ -162,7 +166,7 @@ def _check_audit(cp: SessionCheckpoint, problems: list[str]) -> None:
         problems.append("audit_enabled is false but a sequence_audit block is present")
 
 
-def _check_response(cp: SessionCheckpoint, problems: list[str]) -> None:
+def _check_response(cp: SessionCheckpoint, problems: list[str], tail_len: int | None) -> None:
     """The stored append response must restate the checkpoint state.
 
     An identical resend of the last fragment returns this stored response, so
@@ -190,8 +194,16 @@ def _check_response(cp: SessionCheckpoint, problems: list[str]) -> None:
         problems.append("last_response.tail.payload_b64 does not match the checkpoint tail")
     if resp.tail.end != cp.received_offset:
         problems.append("last_response.tail.end does not equal received_offset")
-    if resp.tail.start > resp.tail.end:
-        problems.append("last_response.tail.start is after tail.end")
+    # The response is replayed verbatim on the next identical append, so its
+    # tail interval must be exactly the pending-tail window of the durable
+    # state: end == received_offset and start == received_offset - tail bytes.
+    # A merely non-inverted interval (start < end) is not enough — an earlier
+    # start would replay a response that re-attaches bytes already accepted.
+    if tail_len is not None and resp.tail.start != cp.received_offset - tail_len:
+        problems.append(
+            "last_response.tail.start does not equal received_offset minus the "
+            "decoded tail byte count"
+        )
     if resp.received_offset != cp.last_chunk_offset:
         problems.append(
             "last_response.received_offset does not equal last_chunk_offset"

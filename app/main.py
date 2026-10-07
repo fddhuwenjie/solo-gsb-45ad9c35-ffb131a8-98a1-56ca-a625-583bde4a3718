@@ -649,11 +649,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """Import a checkpointed session so it continues under its original id.
 
         Only accepted when the target database has the exact protocol version
-        registered with an identical definition digest, no session with the
-        checkpoint id exists yet, and the checkpoint is internally consistent
-        (tail/offset and the stored original response self-consistent). On
-        success every state element lands in one row/transaction; on any
-        failure the target database is left completely untouched.
+        registered with an identical definition digest (and, for audited
+        sessions, a valid sequence field whose effective bit width matches the
+        checkpoint and whose imported baseline lies in the protocol's sequence
+        range), no session with the checkpoint id exists yet, and the
+        checkpoint is internally consistent (tail/offset and the stored
+        original response self-consistent, including the tail start being
+        exactly received_offset minus the decoded tail bytes). Protocol
+        verification and the session write run inside one ``BEGIN IMMEDIATE``
+        transaction, so a concurrent protocol registration cannot slip between
+        the check and the insert. On any failure the target database is left
+        completely untouched.
         """
         try:
             raw = json.loads(await request.body())
@@ -710,6 +716,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "definition_sha256": checkpoint.definition_sha256,
                     },
                 )
+            _raise_for_audit_mismatch(db, checkpoint, result)
             if result == "session_exists":
                 raise SessionImportConflictError(
                     message=(
@@ -726,6 +733,56 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return _progress_from_row(row)
 
     return app
+
+
+def _raise_for_audit_mismatch(db: Database, checkpoint: SessionCheckpoint, result: str) -> None:
+    """Translate the import transaction's protocol/audit verdicts to 422s.
+
+    These checks ran inside the import write transaction against the exact
+    registered protocol definition; nothing was written when they fail.
+    """
+    if result not in (
+        "audit_field_unsupported",
+        "audit_bit_width_mismatch",
+        "audit_sequence_out_of_range",
+    ):
+        return
+    audit = checkpoint.sequence_audit
+    details: dict = {
+        "reason": result,
+        "protocol_id": checkpoint.protocol_id,
+        "version": checkpoint.version,
+    }
+    found = db.find_protocol(checkpoint.protocol_id, checkpoint.version)
+    if found is not None:
+        proto, _ = found
+        details["sequence_field"] = proto.sequence_field
+        details["target_bit_width"] = sequence_bit_width(proto)
+    if audit is not None:
+        details["checkpoint_bit_width"] = audit.bit_width
+        details["last_sequence"] = audit.last_sequence
+
+    if result == "audit_field_unsupported":
+        message = (
+            "the target protocol's declared sequence_field is not a valid "
+            "unsigned integer field of at least 2 effective bits; the "
+            "checkpointed sequence audit cannot continue under it"
+        )
+    elif result == "audit_bit_width_mismatch":
+        message = (
+            "checkpoint sequence_audit.bit_width does not match the effective "
+            "bit width of the target protocol's exact sequence field"
+        )
+    else:
+        width = details.get("target_bit_width") or (
+            audit.bit_width if audit is not None else None
+        )
+        details["max_sequence"] = (1 << width) - 1 if width else None
+        message = (
+            "checkpoint sequence_audit.last_sequence is outside the target "
+            "protocol's sequence baseline range [0, 2**bit_width)"
+        )
+    raise SessionCheckpointInvalidError(message=message, details=details)
 
 
 def _progress_from_row(row: dict) -> dict:
